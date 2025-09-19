@@ -1,0 +1,393 @@
+# === APP ===
+import os, re, unicodedata, random, json, glob
+from typing import Tuple, Optional
+import numpy as np
+from PIL import Image
+
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras.applications.efficientnet import preprocess_input  # dùng riêng cho chuẩn hóa giống trước (0-255 -> EfficientNet style); với ANN bạn có thể thay = x/255 nếu muốn
+
+import pandas as pd
+import gradio as gr
+
+# ===== CONFIG =====
+WORKDIR  = "/content/flowers5_workdir"
+MODEL    = os.path.join(WORKDIR, "flowers5_ann.keras")   # <— ANN THUẦN
+META     = os.path.join(WORKDIR, "meta.json")
+
+# Dataset CHỈ dùng cho “Ảnh tham chiếu” & “Lấy mẫu ngẫu nhiên” (có cũng được, không có vẫn chạy).
+DATA_DIR = os.environ.get("FLOWERS_DATA_DIR", "/content/flowers5_fast")
+
+IMG_SIZE = (128, 128)   # phải khớp size lúc train ANN thuần
+SEED     = 1337
+random.seed(SEED); np.random.seed(SEED); tf.random.set_seed(SEED)
+
+# ===== LABELS & INFO) =====
+CANON = ["linh_lan","lam_tinh","huong_duong","thuoc_phien","tulip"]
+SYN = {
+  "linh_lan":["linh lan","lan chuong","lily of the valley","convallaria","convallaria majalis"],
+  "lam_tinh":["lam tinh","sao xanh","tweedia","oxypetalum","oxypetalum coeruleum","blue starflower"],
+  "huong_duong":["huong duong","hướng dương","sunflower","helianthus","helianthus annuus"],
+  "thuoc_phien":["thuoc phien","thuốc phiện","anh túc","poppy","papaver","papaver somniferum"],
+  "tulip":["tulip","tulipa","uất kim hương","uat kim huong"]
+}
+INFO = {
+  "linh_lan":{"vn":"Linh lan (Lan chuông)","sci":"Convallaria majalis","desc":"Hoa nhỏ hình chuông, hương dịu; có độc tính nếu ăn phải.","mean":["Thuần khiết, khiêm nhường","Tái ngộ hạnh phúc"]},
+  "lam_tinh":{"vn":"Lam tinh (Sao xanh/Tweedia)","sci":"Oxypetalum coeruleum","desc":"5 cánh hình sao, xanh lam trong; hay dùng trang trí.","mean":["Tình yêu ghé thăm, hy vọng","Bình yên"]},
+  "huong_duong":{"vn":"Hướng dương","sci":"Helianthus annuus","desc":"Cánh vàng rực, hay hướng theo mặt trời.","mean":["Lạc quan, tích cực","Chung thủy, ngưỡng mộ"]},
+  "thuoc_phien":{"vn":"Thuốc phiện (Anh túc/Poppy)","sci":"Papaver somniferum","desc":"Cánh mỏng nhiều màu; quả nang có mủ trắng (opium).","mean":["Giấc ngủ, an nghỉ","Tưởng nhớ"]},
+  "tulip":{"vn":"Tulip","sci":"Tulipa spp.","desc":"Thân hành, nở đầu xuân; nhiều màu, dáng trang nhã.","mean":["Tình yêu, tri ân","Thanh lịch, sang trọng"]},
+}
+EMOJI = {"linh_lan":"🔔","lam_tinh":"💠","huong_duong":"🌻","thuoc_phien":"🌺","tulip":"🌷"}
+
+def _norm(s:str)->str:
+  s = unicodedata.normalize("NFD", s).encode("ascii","ignore").decode("ascii")
+  return re.sub(r"\s+"," ", re.sub(r"[^a-z0-9]+"," ", s.lower())).strip()
+REV={}; [REV.setdefault(_norm(x),k) for k,arr in SYN.items() for x in (arr+[k])]
+def _map_folder(name:str): return REV.get(_norm(name))
+
+# ===== LOAD MODEL & META =====
+def load_model_and_meta():
+  if not os.path.exists(MODEL):
+    raise FileNotFoundException(f"Không tìm thấy model ANN: {MODEL}. Hãy chạy notebook TRAIN trước.")
+  if not os.path.exists(META):
+    raise FileNotFoundError(f"Không tìm thấy meta: {META}. Hãy chạy notebook TRAIN trước.")
+  with open(META,"r",encoding="utf-8") as f: meta=json.load(f)
+  class_names = meta["class_names"]
+
+  # Tạo mapping folder -> canon (dựa trên synonyms), nếu không map được thì để None
+  folder2canon = {}
+  for folder in class_names:
+    c = _map_folder(folder)
+    folder2canon[folder] = c  # có thể là None
+
+  m = keras.models.load_model(MODEL)
+  return m, class_names, folder2canon
+
+model, CLASS_NAMES, FOLDER2CANON = load_model_and_meta()
+
+# ===== Ảnh tham chiếu =====
+def collect_train_images():
+  store={}
+  if not os.path.isdir(DATA_DIR):
+    return store
+  for folder in CLASS_NAMES:
+    d=os.path.join(DATA_DIR, folder)
+    files=[]
+    for ext in ("*.jpg","*.jpeg","*.png","*.JPG","*.JPEG","*.PNG"):
+      files.extend(glob.glob(os.path.join(d, ext)))
+    store[folder]=files
+  return store
+TRAIN_IMGS = collect_train_images()
+
+def _reference_image_for(folder:str, fallback:Image.Image):
+  paths = TRAIN_IMGS.get(folder) or []
+  random.shuffle(paths)
+  for p in paths[:10]:
+    try: return Image.open(p).convert("RGB")
+    except: pass
+  return fallback
+
+# ===== Grad-CAM =====
+def _find_last_conv(layer):
+  if isinstance(layer, tf.keras.layers.Conv2D): return layer
+  if hasattr(layer, "layers"):
+    for l in reversed(layer.layers):
+      out = _find_last_conv(l)
+      if out is not None: return out
+  return None
+
+def grad_cam_overlay(img_raw_uint8: np.ndarray, arr_preproc: np.ndarray, alpha: float=0.4) -> Optional[Image.Image]:
+  try:
+    last_conv = None
+    for l in reversed(model.layers):
+      last_conv = _find_last_conv(l)
+      if last_conv is not None: break
+    if last_conv is None: return None   # ANN MLP: không có conv ⇒ trả None
+
+    grad_model = tf.keras.Model([model.inputs], [last_conv.output, model.output])
+    with tf.GradientTape() as tape:
+      conv_out, preds = grad_model(arr_preproc, training=False)
+      top = tf.argmax(preds[0])
+      top_logit = preds[:, top]
+    grads = tape.gradient(top_logit, conv_out)[0]
+    weights = tf.reduce_mean(grads, axis=(0,1))
+    cam = tf.reduce_sum(tf.multiply(weights, conv_out[0]), axis=-1)
+    cam = tf.maximum(cam, 0) / (tf.reduce_max(cam) + 1e-8)
+    heat = cam.numpy()
+
+    h = (heat * 255).astype(np.uint8)
+    h = Image.fromarray(h).resize(IMG_SIZE, Image.BILINEAR)
+    h = np.asarray(h).astype(np.float32)/255.0
+    heat_rgb = np.stack([h*255, h*60, h*180], axis=2)
+    base = img_raw_uint8.astype(np.float32)
+    over = np.clip((1.0-alpha)*base + alpha*heat_rgb, 0, 255).astype(np.uint8)
+    return Image.fromarray(over)
+  except Exception:
+    return None
+
+# ===== UI helpers=====
+def _card(title_html:str, body_html:str)->str:
+  return f"""
+  <div class="card">
+    <div class="card-title">{title_html}</div>
+    <div class="card-body">{body_html}</div>
+  </div>"""
+
+def _bars_html(probs:np.ndarray, topk:int=5)->str:
+  order = np.argsort(-probs)[:max(1, min(topk, len(probs)))]
+  rows=[]
+  for rank, i in enumerate(order):
+    folder = CLASS_NAMES[i]
+    canon  = FOLDER2CANON.get(folder)  # có thể None
+    vn     = INFO.get(canon, {}).get("vn", folder)  # fallback dùng tên thư mục
+    emoji  = EMOJI.get(canon, "🌸")
+    pct = float(probs[i])*100
+    color = "var(--brand-grad)" if rank==0 else "#e5e7eb"
+    rows.append(f"""
+      <div class="bar-row">
+        <div class="bar-top">
+          <span class="bar-label">{emoji} {vn}</span>
+          <span class="bar-val">{pct:.1f}%</span>
+        </div>
+        <div class="bar">
+          <div class="bar-fill {'shine' if rank==0 else ''}" style="width:{pct:.2f}%;background:{color}"></div>
+        </div>
+      </div>""")
+  return _card("Xác suất theo lớp", "".join(rows))
+
+def _info_html_from_canon(canon:Optional[str], folder:str)->str:
+  if canon in INFO:
+    info=INFO[canon]
+    li="".join(f"<li>{m}</li>" for m in info["mean"])
+    body=f"""
+      <div class="info-sci chip chip-ghost"><span>🔎</span><i>{info['sci']}</i></div>
+      <div class="info-desc">{info['desc']}</div>
+      <div class="info-sub">Ý nghĩa</div>
+      <ul class="info-ul">{li}</ul>
+    """
+    title = info["vn"]
+  else:
+    # Fallback khi không map được canon
+    body=f"<div class='info-desc'>Chưa có mô tả chuẩn cho lớp <code>{folder}</code>.</div>"
+    title = folder
+  return _card(title, body)
+
+# ===== PREDICT =====
+def predict(img:Image.Image, display_mode:str, cam_alpha:float, topk:int, threshold:float):
+  if img is None:
+    return None, _card("Kết quả", "Hãy tải ảnh."), _card("Xác suất theo lớp",""), _card("Thông tin","")
+
+  x=img.convert("RGB").resize(IMG_SIZE)
+  raw_uint8 = np.array(x, dtype=np.uint8)
+  # ANN thuần: lúc train dùng x/255; ở đây để nhất quán bạn có thể thay bằng raw_uint8/255.0
+  arr_pre = np.expand_dims(raw_uint8.astype(np.float32)/255.0, 0)
+
+  probs = model.predict(arr_pre, verbose=0)[0]
+  top = int(np.argmax(probs)); folder=CLASS_NAMES[top]; canon=FOLDER2CANON.get(folder)
+
+  if display_mode == "Ảnh gốc":
+    cam = grad_cam_overlay(raw_uint8, arr_pre, alpha=float(cam_alpha))  # với ANN MLP sẽ trả None
+    out_img = cam if cam is not None else img
+  else:
+    out_img = _reference_image_for(folder, img)
+
+  warn = ""
+  if probs[top] < max(0.0, min(1.0, threshold)):
+    warn = f"<div class='warn'>⚠️ Độ tin cậy thấp ({probs[top]:.1%}). Hãy thử ảnh cận cảnh & sáng hơn.</div>"
+
+  res_body = f"""
+    <div class='badge-row'>
+      <span class='chip chip-brand'>ANN</span>
+      <span class='chip chip-soft'>Top-1</span>
+    </div>
+    <div class='pred-name glow'>{EMOJI.get(canon,'🌸')} {INFO.get(canon,{}).get('vn', folder)}</div>
+    <div class='pred-sub'>Độ tin cậy: {probs[top]:.2%}</div>{warn}
+  """
+  bars_html = _bars_html(probs, topk=topk)
+  info_html = _info_html_from_canon(canon, folder)
+
+  return out_img, _card("Kết quả", res_body), bars_html, info_html
+
+def predict_files(files, topk:int, threshold:float):
+  rows=[]
+  for f in files or []:
+    try:
+      img = Image.open(f.name).convert("RGB").resize(IMG_SIZE)
+      raw_uint8 = np.array(img, dtype=np.uint8)
+      arr_pre = np.expand_dims(raw_uint8.astype(np.float32)/255.0, 0)
+      probs = model.predict(arr_pre, verbose=0)[0]
+      top = int(np.argmax(probs)); folder=CLASS_NAMES[top]; canon=FOLDER2CANON.get(folder)
+      rows.append({"file": os.path.basename(f.name),
+                   "prediction": INFO.get(canon,{}).get("vn", folder),
+                   "confidence": float(probs[top])})
+    except Exception as e:
+      rows.append({"file": os.path.basename(getattr(f,'name','?')),
+                   "prediction": f"ERROR: {type(e).__name__}", "confidence": 0.0})
+  df = pd.DataFrame(rows)
+  out_csv = os.path.join(WORKDIR, "predictions.csv")
+  df.to_csv(out_csv, index=False)
+  return df, out_csv
+
+def get_model_file():
+  return MODEL if os.path.exists(MODEL) else None
+
+def mapping_md():
+  if not os.path.exists(META): return "Chưa có META."
+  with open(META,"r",encoding="utf-8") as f: meta=json.load(f)
+  cn = meta["class_names"]
+  rows = ["| Thư mục | Nhãn chuẩn (nếu map được) |", "|---|---|"]
+  for folder in cn:
+    canon = FOLDER2CANON.get(folder)
+    disp = canon if canon else "—"
+    rows.append(f"| `{folder}` | {disp} |")
+  return "\n".join(rows)
+
+# ===== CSS  =====
+CSS = """
+:root, .gradio-container {
+  --brand1:#6366F1; --brand2:#A855F7; --brand3:#06B6D4;
+  --ink:#111827; --muted:#6b7280; --line:#e5e7eb; --bg:#f8fafc;
+  --card-bg:#ffffff; --shadow:0 10px 30px rgba(2,6,23,.08);
+  --brand-grad: linear-gradient(90deg,var(--brand1),var(--brand2));
+  color: var(--ink);
+}
+.gradio-container { background: var(--bg); font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto; }
+
+/* Header hero */
+#hero {
+  position:relative; padding:20px 16px 8px; border-radius:20px;
+  background: radial-gradient(1200px 300px at 0% -10%, #dbeafe 0%, transparent 55%),
+              radial-gradient(1200px 300px at 100% -10%, #f5d0fe 0%, transparent 55%);
+  border:1px solid var(--line);
+  box-shadow: var(--shadow);
+}
+#title {
+  font-weight:900; font-size:28px; letter-spacing:.2px; margin:0;
+  background: var(--brand-grad); -webkit-background-clip:text; background-clip:text; color:transparent;
+}
+.stickers { font-size:22px; margin:6px 0 2px; }
+
+/* Cards */
+.card { position: relative; background: var(--card-bg); border-radius:16px; padding:14px; border:1px solid var(--line); box-shadow: var(--shadow); }
+.card::before { content:""; position:absolute; inset:-1px; border-radius:17px; z-index:-1;
+  background: linear-gradient(135deg, #fff, rgba(255,255,255,0)), linear-gradient(90deg, rgba(99,102,241,.25), rgba(168,85,247,.25));
+  filter: blur(.6px);
+}
+.card-title { font-weight:800; margin-bottom:6px; }
+.card-body { color:#374151; }
+
+/* Chips / badges */
+.badge-row { display:flex; gap:8px; margin-bottom:6px; }
+.chip { display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:999px; font-size:12px; line-height:1; border:1px solid var(--line); }
+.chip-brand { background-image: var(--brand-grad); color:white; border:none; box-shadow:0 6px 16px rgba(99,102,241,.25); }
+.chip-soft  { background:#eef2ff; color:#4f46e5; border-color:#c7d2fe; }
+.chip-ghost { background:#f1f5f9; color:#334155; }
+
+/* Pred */
+.pred-name { font-weight:900; font-size:20px; margin-top:4px; }
+.glow { text-shadow:0 0 0 rgba(0,0,0,0); animation: glow 3s ease-in-out infinite; }
+@keyframes glow { 0%,100%{ text-shadow:0 0 0 rgba(99,102,241,0);} 50%{ text-shadow:0 0 14px rgba(168,85,247,.25);} }
+.pred-sub { color:var(--muted); margin-top:4px; }
+.warn { margin-top:10px; color:#b45309; background:#fffbeb; border:1px solid #f59e0b66; padding:10px 12px; border-radius:12px; }
+
+/* Bars */
+.bar-row { margin:10px 0; }
+.bar-top { display:flex; justify-content:space-between; font-size:13px; color:#374151; margin-bottom:6px; }
+.bar { height:10px; border-radius:999px; background:#f1f5f9; border:1px solid var(--line); overflow:hidden; }
+.bar-fill { height:10px; border-radius:999px; transition: width .45s ease; background: #e5e7eb; }
+.bar-fill.shine { background: var(--brand-grad); position:relative; }
+.bar-fill.shine::after{ content:""; position:absolute; inset:0; background:
+  linear-gradient(120deg, rgba(255,255,255,.0) 30%, rgba(255,255,255,.35) 50%, rgba(255,255,255,.0) 70%); animation: sweep 1.8s linear infinite; }
+@keyframes sweep { from { transform: translateX(-100%);} to { transform: translateX(100%);} }
+.bar-label { font-weight:600; }
+
+/* Inputs & buttons */
+.gr-button { border-radius:999px !important; border:none !important; }
+button.svelte-1ipelgc, .gr-button { background-image: var(--brand-grad) !important; color:white !important; }
+button.svelte-1ipelgc:hover, .gr-button:hover { filter:brightness(.95); transform: translateY(-1px); }
+input[type="range"] { accent-color:#7c3aed; }
+
+/* Images */
+.gr-image img { border-radius:14px; border:1px solid var(--line); box-shadow: var(--shadow); }
+
+/* Layout tweaks */
+.subtitle { color:var(--muted); font-size:13px; margin-bottom:12px; }
+.info-sci { margin:4px 0 6px; }
+.info-sub { font-weight:800; margin-top:10px; }
+.info-ul { margin:6px 0 0 18px; }
+"""
+
+# ===== UI =====
+with gr.Blocks(css=CSS, title="Mô hình nhận diện hoa bằng ANN — Xanh Tím (Pro)") as app:
+  gr.HTML('<div id="hero"><h1 id="title">🌺 Mô hình nhận diện hoa bằng ANN</h1><div class="stickers">🌸 🌼 🌷 🌻 🪻</div></div>')
+  gr.Markdown('<div class="subtitle">Giao diện sáng · CAM overlay (nếu khả dụng) · Dự đoán hàng loạt · Tiện ích</div>')
+
+  with gr.Tab("Dự đoán 1 ảnh"):
+    with gr.Row():
+      with gr.Column(scale=1):
+        gr.HTML('<div class="card"><div class="card-title">Tải ảnh</div><div class="card-body">Chọn ảnh hoa (kéo-thả/chọn file). Ảnh rõ bông chính → kết quả tốt hơn.</div></div>')
+        inp = gr.Image(type="pil", label=None)
+
+        display_mode = gr.Radio(["Ảnh gốc", "Ảnh tham chiếu (từ tập train)"], value="Ảnh gốc", label="Ảnh hiển thị")
+        cam_alpha   = gr.Slider(0.1, 0.9, value=0.4, step=0.05, label="Độ đậm Grad-CAM (khi Ảnh hiển thị = Ảnh gốc)")
+        topk        = gr.Slider(1, 5, value=5, step=1, label="Top-K hiển thị")
+        threshold   = gr.Slider(0.0, 1.0, value=0.20, step=0.01, label="Ngưỡng cảnh báo độ tin cậy")
+
+        with gr.Row():
+          btn = gr.Button("Dự đoán", variant="primary")
+          sample_btn = gr.Button("Lấy mẫu ngẫu nhiên")
+          clr = gr.Button("Xoá")
+
+      with gr.Column(scale=1):
+        out_img  = gr.Image(label="Ảnh hiển thị", interactive=False)
+        out_res  = gr.HTML()
+        out_bar  = gr.HTML()
+        out_info = gr.HTML()
+
+    btn.click(predict, [inp, display_mode, cam_alpha, topk, threshold],
+              [out_img, out_res, out_bar, out_info])
+    inp.change(predict, [inp, display_mode, cam_alpha, topk, threshold],
+               [out_img, out_res, out_bar, out_info])
+    clr.click(lambda: (None, "", "", ""), None, [out_img, out_res, out_bar, out_info])
+
+    def _random_sample_img():
+      if not os.path.isdir(DATA_DIR):
+        return None
+      all_files=[]
+      for folder in CLASS_NAMES:
+        d=os.path.join(DATA_DIR, folder)
+        for ext in ("*.jpg","*.jpeg","*.png","*.JPG","*.JPEG","*.PNG"):
+          all_files.extend(glob.glob(os.path.join(d, ext)))
+      if not all_files: return None
+      for _ in range(20):
+        p=random.choice(all_files)
+        try: return Image.open(p).convert("RGB")
+        except: continue
+      return None
+    sample_btn.click(_random_sample_img, None, inp).then(
+        predict, [inp, display_mode, cam_alpha, topk, threshold],
+        [out_img, out_res, out_bar, out_info]
+    )
+
+  with gr.Tab("Hàng loạt"):
+    gr.Markdown("Chọn **nhiều ảnh** JPG/PNG để dự đoán và tải **CSV** kết quả.")
+    fls   = gr.Files(file_count="multiple", label="Chọn ảnh")
+    topk_b  = gr.Slider(1, 5, value=5, step=1, label="Top-K (log)")
+    thr_b   = gr.Slider(0.0, 1.0, value=0.0, step=0.01, label="Ngưỡng (log)")
+    btnb  = gr.Button("Dự đoán hàng loạt")
+    outdf = gr.Dataframe(label="Kết quả")
+    outcsv= gr.File(label="Tải CSV")
+    btnb.click(predict_files, inputs=[fls, topk_b, thr_b], outputs=[outdf, outcsv])
+
+  with gr.Tab("Tiện ích"):
+    gr.Markdown("• **Tải model** đã huấn luyện · • **Xem mapping** thư mục ↔ canon (nếu map được)")
+    getm = gr.Button("Xuất model (.keras)")
+    f_model = gr.File(label="Tải file model")
+    getm.click(get_model_file, outputs=f_model)
+    map_btn = gr.Button("Xem mapping lớp")
+    map_md  = gr.Markdown()
+    map_btn.click(mapping_md, outputs=map_md)
+
+app.launch(share=True)
