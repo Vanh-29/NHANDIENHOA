@@ -1,0 +1,88 @@
+import os, json, random, numpy as np, tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+import matplotlib.pyplot as plt
+
+# ===== CONFIG =====
+DATA_DIR = os.environ.get("FLOWERS_DATA_DIR", "/content/flowers5_fast")
+WORKDIR  = "/content/flowers5_workdir"
+MODEL    = os.path.join(WORKDIR, "flowers5_ann.keras")
+META     = os.path.join(WORKDIR, "meta.json")
+
+IMG_SIZE = (128, 128)
+BATCH    = 32
+EPOCHS   = 10
+SEED     = 1337
+
+os.makedirs(WORKDIR, exist_ok=True)
+random.seed(SEED); np.random.seed(SEED); tf.random.set_seed(SEED)
+
+# ===== DATA =====
+def make_datasets():
+    train_ds = tf.keras.preprocessing.image_dataset_from_directory(
+        DATA_DIR, labels="inferred",
+        validation_split=0.2, subset="training", seed=SEED,
+        image_size=IMG_SIZE, batch_size=BATCH, shuffle=True)
+    val_ds = tf.keras.preprocessing.image_dataset_from_directory(
+        DATA_DIR, labels="inferred",
+        validation_split=0.2, subset="validation", seed=SEED,
+        image_size=IMG_SIZE, batch_size=BATCH, shuffle=False)
+    def map_norm(x,y): return (tf.cast(x, tf.float32)/255.0, y)
+    AUTOTUNE = tf.data.AUTOTUNE
+    return (
+        train_ds.map(map_norm).prefetch(AUTOTUNE),
+        val_ds.map(map_norm).prefetch(AUTOTUNE),
+        train_ds.class_names
+    )
+
+train_ds, val_ds, class_names = make_datasets()
+
+with open(META,"w",encoding="utf-8") as f:
+    json.dump({"class_names":class_names}, f, ensure_ascii=False, indent=2)
+
+print("✅ Classes:", class_names)
+
+# ===== MODEL ANN =====
+def build_ann(input_shape, n_classes):
+    inp = keras.Input(shape=input_shape)
+    x = layers.Flatten()(inp)
+    x = layers.Dense(512, activation="relu")(x)
+    x = layers.Dropout(0.3)(x)
+    x = layers.Dense(256, activation="relu")(x)
+    x = layers.Dropout(0.3)(x)
+    out = layers.Dense(n_classes, activation="softmax")(x)
+    m = keras.Model(inp, out, name="flowers5_ann")
+    m.compile(optimizer=keras.optimizers.Adam(1e-3),
+              loss="sparse_categorical_crossentropy",
+              metrics=["accuracy"])
+    return m
+
+model = build_ann(IMG_SIZE+(3,), len(class_names))
+model.summary()
+
+# ===== TRAIN =====
+cbs = [
+    EarlyStopping(monitor="val_accuracy", patience=3, restore_best_weights=True, verbose=1),
+    ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=2, min_lr=1e-6, verbose=1),
+]
+
+history = model.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=EPOCHS,
+    verbose=1,
+    callbacks=cbs
+)
+
+model.save(MODEL)
+print("✅ Model saved:", MODEL)
+
+# ===== PLOT =====
+plt.plot(history.history["accuracy"], label="Train acc")
+plt.plot(history.history["val_accuracy"], label="Val acc")
+plt.legend(); plt.title("Accuracy"); plt.show()
+
+plt.plot(history.history["loss"], label="Train loss")
+plt.plot(history.history["val_loss"], label="Val loss")
+plt.legend(); plt.title("Loss"); plt.show()
